@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -52,6 +53,13 @@ func Setup(cmd *cobra.Command, dockerCli command.Cli, args []string) error {
 	}
 
 	ctx := cmd.Context()
+	// Adopt a parent trace context from the environment (W3C TRACEPARENT /
+	// TRACESTATE) when present. This lets `docker compose`, when spawned as a
+	// child process by an outer traced tool (e.g. a CI runner that sets
+	// TRACEPARENT), nest its command span — and the dockerd/containerd spans it
+	// triggers — under the caller's span instead of starting a disconnected root
+	// trace. No-op when TRACEPARENT is unset (Extract returns ctx unchanged).
+	ctx = otel.GetTextMapPropagator().Extract(ctx, envTraceCarrier{})
 	ctx, cmdSpan := otel.Tracer("").Start(
 		ctx,
 		"cli/"+strings.Join(commandName(cmd), "-"),
@@ -137,6 +145,22 @@ func commandName(cmd *cobra.Command) []string {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(name)))
 	return name
+}
+
+// envTraceCarrier adapts process environment variables to a
+// propagation.TextMapCarrier so the configured (W3C TraceContext) propagator
+// can extract a parent span context from TRACEPARENT / TRACESTATE. Keys are
+// upper-cased to match conventional environment variable spelling.
+type envTraceCarrier struct{}
+
+func (envTraceCarrier) Get(key string) string {
+	return os.Getenv(strings.ToUpper(key))
+}
+
+func (envTraceCarrier) Set(string, string) {}
+
+func (envTraceCarrier) Keys() []string {
+	return []string{"traceparent", "tracestate"}
 }
 
 func getFlags(fs *flag.FlagSet) []string {
