@@ -30,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -93,10 +94,17 @@ func InitProvider(dockerCli command.Cli) (ShutdownFunc, error) {
 		return nil, errors.Join(errs...)
 	}
 
+	// Honor OTEL_SERVICE_NAME (standard OTLP env) so Compose's spans can be
+	// attributed to the surrounding service when invoked as a child process.
+	// This also lets a collector that allowlists by service.name ingest them.
+	serviceName := "compose"
+	if v := os.Getenv("OTEL_SERVICE_NAME"); v != "" {
+		serviceName = v
+	}
 	res, err := resource.New(
 		ctx,
 		resource.WithAttributes(
-			semconv.ServiceName("compose"),
+			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(internal.Version),
 			attribute.String("docker.context", dockerCli.CurrentContext()),
 		),
@@ -140,6 +148,34 @@ func traceClientFromEnv() (otlptrace.Client, envMap) {
 		return nil, nil
 	}
 
-	client := otlptracegrpc.NewClient()
-	return client, otelEnv
+	return otlpTraceClient(otelEnv), otelEnv
+}
+
+// otlpTraceClient selects the OTLP transport (HTTP vs gRPC) for the trace
+// exporter. It honors OTEL_EXPORTER_OTLP_TRACES_PROTOCOL / OTEL_EXPORTER_OTLP_PROTOCOL
+// per the OTLP exporter spec; when neither is set it infers HTTP from an endpoint
+// that carries an OTLP/HTTP path (".../v1/traces"), otherwise defaults to gRPC
+// (Compose's historical default). Without this, an OTLP/HTTP collector endpoint
+// is unreachable (the gRPC client cannot talk to it), so Compose's own spans are
+// never exported and any daemon spans that descend from them are orphaned.
+func otlpTraceClient(otelEnv envMap) otlptrace.Client {
+	proto := otelEnv["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"]
+	if proto == "" {
+		proto = otelEnv["OTEL_EXPORTER_OTLP_PROTOCOL"]
+	}
+	if proto == "" {
+		endpoint := otelEnv["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
+		if endpoint == "" {
+			endpoint = otelEnv["OTEL_EXPORTER_OTLP_ENDPOINT"]
+		}
+		if strings.Contains(endpoint, "/v1/") {
+			proto = "http/protobuf"
+		}
+	}
+	switch proto {
+	case "http/protobuf", "http/json", "http":
+		return otlptracehttp.NewClient()
+	default:
+		return otlptracegrpc.NewClient()
+	}
 }
